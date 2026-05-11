@@ -35,6 +35,7 @@ try:
         SpanKind,  # noqa: F401
         Tracer,
         set_tracer_provider,
+        Link,
     )
     from opentelemetry.trace.propagation.tracecontext import (
         TraceContextTextMapPropagator,
@@ -51,6 +52,7 @@ except ImportError:
     inject = None  # type: ignore
     Resource = None  # type: ignore
     SpanKind = Any  # type: ignore
+    Link = Any  # type: ignore
 
 
 def is_otel_available() -> bool:
@@ -263,3 +265,35 @@ def propagate_trace_to_env():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = original_value
+
+
+@contextmanager
+def start_trace_span(
+    span_name: str,
+    context: Context | None = None,
+    attributes: dict[str, Any] | None = None,
+    links: list[Any] | None = None,
+):
+    if not _IS_OTEL_AVAILABLE:
+        yield None
+        return
+
+    tracer = trace.get_tracer("vllm")
+    ctx = context if context is not None else _get_smart_context()
+
+    otel_links = []
+    if links:
+        for link in links:
+            if isinstance(link, Link):
+                otel_links.append(link)
+            elif hasattr(link, "get_span_context"):
+                otel_links.append(Link(link.get_span_context()))
+
+    with tracer.start_as_current_span(
+        name=span_name,
+        context=ctx,
+        attributes=attributes,
+        links=otel_links,
+    ) as span:
+        yield span
+

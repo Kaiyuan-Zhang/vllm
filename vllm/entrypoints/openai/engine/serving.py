@@ -582,7 +582,23 @@ class OpenAIServing:
         is_tracing_enabled = await self.engine_client.is_tracing_enabled()
 
         if is_tracing_enabled:
-            return extract_trace_headers(headers)
+            if contains_trace_headers(headers):
+                return extract_trace_headers(headers)
+
+            # Triggered Mode: generate trace context on-demand
+            vllm_trace_header = headers.get("x-vllm-trace")
+            if vllm_trace_header in ("true", "1"):
+                try:
+                    from opentelemetry import trace
+                    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+                    tracer = trace.get_tracer("vllm-ingress")
+                    with tracer.start_as_current_span("vllm_triggered_request") as span:
+                        ctx_headers = {}
+                        TraceContextTextMapPropagator().inject(ctx_headers)
+                        return ctx_headers
+                except ImportError:
+                    pass
 
         if contains_trace_headers(headers):
             log_tracing_disabled_warning()

@@ -15,6 +15,7 @@ from .otel import (
     is_otel_available,
     manual_instrument_otel,
     otel_import_error_traceback,
+    start_trace_span,
 )
 from .utils import (
     SpanAttributes,
@@ -36,6 +37,7 @@ __all__ = [
     "log_tracing_disabled_warning",
     "contains_trace_headers",
     "otel_import_error_traceback",
+    "start_trace_span",
 ]
 
 BackendAvailableFunc: TypeAlias = Callable[[], bool]

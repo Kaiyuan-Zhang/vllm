@@ -55,6 +55,7 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.tracing import instrument_manual, extract_trace_context
 
 logger = init_logger(__name__)
 
@@ -745,6 +746,7 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    request.async_kv_load_start_time_ns = time.time_ns()
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
@@ -1752,6 +1754,27 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        # End load span if aborted before completion
+        start_time = getattr(request, "async_kv_load_start_time_ns", None)
+        if start_time is not None:
+            end_time = time.time_ns()
+            trace_context = (
+                extract_trace_context(request.trace_headers)
+                if request.trace_headers
+                else None
+            )
+            instrument_manual(
+                span_name="vllm_async_kv_transfer",
+                start_time=start_time,
+                end_time=end_time,
+                context=trace_context,
+                attributes={
+                    "request_id": request.request_id,
+                    "aborted": True,
+                }
+            )
+            delattr(request, "async_kv_load_start_time_ns")
+
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
@@ -2006,6 +2029,27 @@ class Scheduler(SchedulerInterface):
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
             self._update_waiting_for_remote_kv(request)
+
+            # Instrument the manual OTel span for async KV cache loading
+            start_time = getattr(request, "async_kv_load_start_time_ns", None)
+            if start_time is not None:
+                end_time = time.time_ns()
+                trace_context = (
+                    extract_trace_context(request.trace_headers)
+                    if request.trace_headers
+                    else None
+                )
+                instrument_manual(
+                    span_name="vllm_async_kv_transfer",
+                    start_time=start_time,
+                    end_time=end_time,
+                    context=trace_context,
+                    attributes={
+                        "request_id": request.request_id,
+                    }
+                )
+                delattr(request, "async_kv_load_start_time_ns")
+
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
