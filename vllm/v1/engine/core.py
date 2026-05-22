@@ -417,44 +417,45 @@ class EngineCore:
             return {}, False
         scheduler_output = self.scheduler.schedule()
 
-        # Gather trace contexts from scheduled requests to link the batch span
-        contexts = []
-        for req_data in scheduler_output.scheduled_new_reqs:
-            req = self.scheduler.requests.get(req_data.req_id)
-            if req and req.trace_headers:
-                ctx = extract_trace_context(req.trace_headers)
-                if ctx:
-                    contexts.append((req_data.req_id, ctx, "prefill"))
+        batch_start_time_ns = time.time_ns()
+        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        with (
+            self.log_error_detail(scheduler_output),
+            self.log_iteration_details(scheduler_output),
+        ):
+            model_output = future.result()
+            if model_output is None:
+                model_output = self.model_executor.sample_tokens(grammar_output)
+            batch_end_time_ns = time.time_ns()
 
-        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-            req = self.scheduler.requests.get(req_id)
-            if req and req.trace_headers:
-                ctx = extract_trace_context(req.trace_headers)
-                if ctx:
-                    contexts.append((req_id, ctx, "decode"))
-
-        links = [ctx for _, ctx, _ in contexts]
-        parent_context = contexts[0][1] if contexts else None
-
-        with start_trace_span(
-            "vllm_batch_execution",
-            context=parent_context,
-            links=links,
-            attributes={
+            # Emit per-request vllm_step_execution spans
+            step_attributes = {
                 "num_prefill_requests": len(scheduler_output.scheduled_new_reqs),
                 "num_decode_requests": len(scheduler_output.scheduled_cached_reqs.req_ids),
                 "total_scheduled_tokens": scheduler_output.total_num_scheduled_tokens
             }
-        ):
-            future = self.model_executor.execute_model(scheduler_output, non_block=True)
-            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-            with (
-                self.log_error_detail(scheduler_output),
-                self.log_iteration_details(scheduler_output),
-            ):
-                model_output = future.result()
-                if model_output is None:
-                    model_output = self.model_executor.sample_tokens(grammar_output)
+            prefill_attrs = {"phase": "prefill", **step_attributes}
+            decode_attrs = {"phase": "decode", **step_attributes}
+
+            for req_data in scheduler_output.scheduled_new_reqs:
+                req = self.scheduler.requests.get(req_data.req_id)
+                if req and req.trace_headers:
+                    req.emit_span(
+                        span_name="vllm_step_execution",
+                        start_time=batch_start_time_ns,
+                        end_time=batch_end_time_ns,
+                        attributes=prefill_attrs
+                    )
+            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                req = self.scheduler.requests.get(req_id)
+                if req and req.trace_headers:
+                    req.emit_span(
+                        span_name="vllm_step_execution",
+                        start_time=batch_start_time_ns,
+                        end_time=batch_end_time_ns,
+                        attributes=decode_attrs
+                    )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -505,39 +506,11 @@ class EngineCore:
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
 
-            # Gather trace contexts from scheduled requests to link the batch span
-            contexts = []
-            for req_data in scheduler_output.scheduled_new_reqs:
-                req = self.scheduler.requests.get(req_data.req_id)
-                if req and req.trace_headers:
-                    ctx = extract_trace_context(req.trace_headers)
-                    if ctx:
-                        contexts.append((req_data.req_id, ctx, "prefill"))
-
-            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-                req = self.scheduler.requests.get(req_id)
-                if req and req.trace_headers:
-                    ctx = extract_trace_context(req.trace_headers)
-                    if ctx:
-                        contexts.append((req_id, ctx, "decode"))
-
-            links = [ctx for _, ctx, _ in contexts]
-            parent_context = contexts[0][1] if contexts else None
-
-            with start_trace_span(
-                "vllm_batch_launch",
-                context=parent_context,
-                links=links,
-                attributes={
-                    "num_prefill_requests": len(scheduler_output.scheduled_new_reqs),
-                    "num_decode_requests": len(scheduler_output.scheduled_cached_reqs.req_ids),
-                    "total_scheduled_tokens": scheduler_output.total_num_scheduled_tokens
-                }
-            ):
-                with self.log_error_detail(scheduler_output):
-                    exec_future = self.model_executor.execute_model(
-                        scheduler_output, non_block=True
-                    )
+            scheduler_output.batch_start_time_ns = time.time_ns()
+            with self.log_error_detail(scheduler_output):
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -580,45 +553,47 @@ class EngineCore:
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
 
-        # Gather trace contexts from scheduled requests to link the batch span
-        contexts = []
-        for req_data in scheduler_output.scheduled_new_reqs:
-            req = self.scheduler.requests.get(req_data.req_id)
-            if req and req.trace_headers:
-                ctx = extract_trace_context(req.trace_headers)
-                if ctx:
-                    contexts.append((req_data.req_id, ctx, "prefill"))
-
-        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-            req = self.scheduler.requests.get(req_id)
-            if req and req.trace_headers:
-                ctx = extract_trace_context(req.trace_headers)
-                if ctx:
-                    contexts.append((req_id, ctx, "decode"))
-
-        links = [ctx for _, ctx, _ in contexts]
-        parent_context = contexts[0][1] if contexts else None
-
-        with start_trace_span(
-            "vllm_batch_wait",
-            context=parent_context,
-            links=links,
-            attributes={
-                "num_prefill_requests": len(scheduler_output.scheduled_new_reqs),
-                "num_decode_requests": len(scheduler_output.scheduled_cached_reqs.req_ids),
-                "total_scheduled_tokens": scheduler_output.total_num_scheduled_tokens
-            }
+        batch_start_time_ns = getattr(scheduler_output, "batch_start_time_ns", None)
+        with (
+            self.log_error_detail(scheduler_output),
+            self.log_iteration_details(scheduler_output),
         ):
-            with (
-                self.log_error_detail(scheduler_output),
-                self.log_iteration_details(scheduler_output),
-            ):
-                model_output = future.result()
-                if model_output is None:
-                    # None from sample_tokens() implies that the original execute_model()
-                    # call failed - raise that exception.
-                    exec_model_fut.result()
-                    raise RuntimeError("unexpected error")
+            model_output = future.result()
+            if model_output is None:
+                # None from sample_tokens() implies that the original execute_model()
+                # call failed - raise that exception.
+                exec_model_fut.result()
+                raise RuntimeError("unexpected error")
+            batch_end_time_ns = time.time_ns()
+
+            # Emit per-request vllm_step_execution spans
+            if batch_start_time_ns is not None:
+                step_attributes = {
+                    "num_prefill_requests": len(scheduler_output.scheduled_new_reqs),
+                    "num_decode_requests": len(scheduler_output.scheduled_cached_reqs.req_ids),
+                    "total_scheduled_tokens": scheduler_output.total_num_scheduled_tokens
+                }
+                prefill_attrs = {"phase": "prefill", **step_attributes}
+                decode_attrs = {"phase": "decode", **step_attributes}
+
+                for req_data in scheduler_output.scheduled_new_reqs:
+                    req = self.scheduler.requests.get(req_data.req_id)
+                    if req and req.trace_headers:
+                        req.emit_span(
+                            span_name="vllm_step_execution",
+                            start_time=batch_start_time_ns,
+                            end_time=batch_end_time_ns,
+                            attributes=prefill_attrs
+                        )
+                for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                    req = self.scheduler.requests.get(req_id)
+                    if req and req.trace_headers:
+                        req.emit_span(
+                            span_name="vllm_step_execution",
+                            start_time=batch_start_time_ns,
+                            end_time=batch_end_time_ns,
+                            attributes=decode_attrs
+                        )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
