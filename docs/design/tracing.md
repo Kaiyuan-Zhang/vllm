@@ -114,9 +114,33 @@ Future or detailed-mode span names:
 * `vllm.transport.tpu`
 
 ### **Request lifecycle**
-| mermaid |
-| :---- |
-| `sequenceDiagram     autonumber     participant Client     participant API as API Server     participant Engine as EngineCore     participant Worker     participant KV as KV Connector     participant KVTransport as KV Transport Backend     participant CollTransport as Collective Transport Backend     Client->>API: Request with optional traceparent     API->>API: establish request trace context     API->>Engine: EngineCoreRequest with trace context     Engine->>Engine: vllm.request.queue     Engine->>KV: wait/load remote KV when required     KV->>KVTransport: [optional] backend operation     Engine->>Worker: prefill     Worker->>CollTransport: [optional] collective operation     Worker-->>Engine: first token     Engine->>Worker: decode iterations     Worker->>CollTransport: [optional] collective operation     Worker-->>Engine: final token     Engine-->>API: final EngineCoreOutput     API->>API: llm_request ends` |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant API as API Server
+    participant Engine as EngineCore
+    participant Worker
+    participant KV as KV Connector
+    participant KVTransport as KV Transport Backend
+    participant CollTransport as Collective Transport Backend
+
+    Client->>API: Request with optional traceparent
+    API->>API: establish request trace context
+    API->>Engine: EngineCoreRequest with trace context
+    Engine->>Engine: vllm.request.queue
+    Engine->>KV: wait/load remote KV when required
+    KV->>KVTransport: [optional] backend operation
+    Engine->>Worker: prefill
+    Worker->>CollTransport: [optional] collective operation
+    Worker-->>Engine: first token
+    Engine->>Worker: decode iterations
+    Worker->>CollTransport: [optional] collective operation
+    Worker-->>Engine: final token
+    Engine-->>API: final EngineCoreOutput
+    API->>API: llm_request ends
+```
 
 The diagram is conceptual. The implementation may emit some spans from the frontend and some from EngineCore or workers, depending on where accurate timestamps and parent context are available.
 
