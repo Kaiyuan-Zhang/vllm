@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -995,6 +996,12 @@ class GPUModelRunner(
                 self.max_num_reqs, dtype=torch.int32
             )
         self.layerwise_nvtx_hooks_registered = False
+
+        # Clear startup trace contexts from env so inference steps don't inherit them.
+        os.environ.pop("traceparent", None)
+        os.environ.pop("TRACEPARENT", None)
+        os.environ.pop("tracestate", None)
+        os.environ.pop("TRACESTATE", None)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -4465,6 +4472,7 @@ class GPUModelRunner(
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
                 is_padding=is_padding,
+                trace_headers=scheduler_output.trace_headers,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(

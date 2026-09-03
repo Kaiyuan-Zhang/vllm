@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -61,6 +62,7 @@ from vllm.multimodal.encoder_budget import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.tracing import trace_model_forward
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
@@ -351,6 +353,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.routed_experts_capturer: RoutedExpertsCapturer | None = None
 
         set_offloader(create_offloader(self.vllm_config.offload_config))
+
+        # Clear startup trace contexts from env so inference steps don't inherit them.
+        os.environ.pop("traceparent", None)
+        os.environ.pop("TRACEPARENT", None)
+        os.environ.pop("tracestate", None)
+        os.environ.pop("TRACESTATE", None)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -1902,12 +1910,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(
-                **connector_kwargs, attn_metadata=attn_metadata
-            )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            with trace_model_forward(
+                trace_headers=scheduler_output.trace_headers,
+                num_tokens=input_batch.num_tokens_after_padding,
+            ):
+                self.kv_connector.pre_forward(
+                    **connector_kwargs, attn_metadata=attn_metadata
+                )
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1929,6 +1940,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                trace_headers=scheduler_output.trace_headers,
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
                 if ubatch_state is not None:

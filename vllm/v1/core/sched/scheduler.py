@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.tracing import is_tracing_available
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
@@ -1414,6 +1415,20 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        trace_headers = None
+        if is_tracing_available():
+            trace_headers = {
+                req.request_id: req.trace_headers
+                for req in itertools.chain(
+                    scheduled_new_reqs,
+                    scheduled_running_reqs,
+                    scheduled_resumed_reqs,
+                )
+                if req.trace_headers is not None
+            }
+            if not trace_headers:
+                trace_headers = None
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1436,6 +1451,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            trace_headers=trace_headers,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -303,6 +303,10 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # Trace headers mapping (req_id -> trace_headers) for scheduled requests.
+    # Propagated to workers for model forward pass and KV transfer tracing.
+    trace_headers: dict[str, Mapping[str, str]] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

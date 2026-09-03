@@ -3,7 +3,8 @@
 
 import time
 from collections import defaultdict
-from contextlib import contextmanager
+from collections.abc import Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -184,6 +185,9 @@ class ForwardContext:
     moe_layer_index: int = 0
 
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
+    trace_headers: (
+        Mapping[str, Mapping[str, str]] | list[Mapping[str, str]] | None
+    ) = None
 
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.is_valid_runtime_mode(), (
@@ -227,6 +231,9 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    trace_headers: (
+        Mapping[str, Mapping[str, str]] | list[Mapping[str, str]] | None
+    ) = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -245,6 +252,7 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
+        trace_headers=trace_headers,
     )
 
 
@@ -275,6 +283,9 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    trace_headers: (
+        Mapping[str, Mapping[str, str]] | list[Mapping[str, str]] | None
+    ) = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -344,10 +355,21 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
+        trace_headers=trace_headers,
     )
 
+    forward_trace_cm = nullcontext()
+    if trace_headers:
+        from vllm.tracing import is_tracing_available, trace_model_forward
+
+        if is_tracing_available():
+            forward_trace_cm = trace_model_forward(
+                trace_headers=trace_headers,
+                num_tokens=num_tokens,
+            )
+
     try:
-        with override_forward_context(forward_context):
+        with override_forward_context(forward_context), forward_trace_cm:
             yield
     finally:
         global last_logging_time, batchsize_logging_interval

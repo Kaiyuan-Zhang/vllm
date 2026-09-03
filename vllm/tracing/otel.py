@@ -201,6 +201,7 @@ def manual_instrument_otel(
     attributes: dict[str, Any] | None = None,
     context: Context | None = None,
     kind: Any = None,  # SpanKind, but typed as Any for when OTEL unavailable
+    links: list[Any] | None = None,
 ):
     """Manually create and end a span with explicit timestamps."""
     if not _IS_OTEL_AVAILABLE:
@@ -217,6 +218,10 @@ def manual_instrument_otel(
     }
     if kind is not None:
         span_kwargs["kind"] = kind
+    if links:
+        valid_links = [link for link in links if link is not None]
+        if valid_links:
+            span_kwargs["links"] = valid_links
 
     span = tracer.start_span(**span_kwargs)
     if attributes:
@@ -225,6 +230,22 @@ def manual_instrument_otel(
         span.end(end_time=end_time)
     else:
         span.end()
+
+
+def create_trace_link_otel(trace_headers: dict[str, str] | None) -> Any:
+    """Create an OpenTelemetry Link object from trace headers carrier dict."""
+    if not _IS_OTEL_AVAILABLE or not trace_headers:
+        return None
+
+    ctx = extract_trace_context(trace_headers)
+    if ctx is None:
+        return None
+
+    span_ctx = trace.get_current_span(ctx).get_span_context()
+    if not span_ctx.is_valid:
+        return None
+
+    return trace.Link(span_ctx)
 
 
 def start_request_span_otel(
@@ -265,6 +286,76 @@ def start_request_span_otel(
     TraceContextTextMapPropagator().inject(carrier, context=span_ctx)
 
     return span, carrier
+
+
+@contextmanager
+def trace_model_forward_otel(
+    trace_headers: Mapping[str, Mapping[str, str]]
+    | list[Mapping[str, str]]
+    | None = None,
+    attributes: dict[str, Any] | None = None,
+    num_tokens: int | None = None,
+):
+    """Context manager for tracing model forward passes.
+
+    Creates a 'vllm.model.forward' span representing forward pass execution.
+    If single request, parents the span under the request span for intuitive hierarchy.
+    If multiple requests, links the span to all request spans.
+    Sets the forward span as the active span so that inner operations
+    (e.g., KV transfers, attention kernels) are parented to this forward pass.
+    """
+    if not _IS_OTEL_AVAILABLE:
+        yield
+        return
+
+    # Extract valid headers list and request IDs
+    headers_list: list[Mapping[str, str]] = []
+    request_ids: list[str] = []
+    if isinstance(trace_headers, dict):
+        for req_id, th in trace_headers.items():
+            if th:
+                headers_list.append(th)
+                request_ids.append(str(req_id))
+    elif isinstance(trace_headers, list):
+        headers_list = [th for th in trace_headers if th]
+
+    if not headers_list:
+        yield
+        return
+
+    tracer = _get_tracer(__name__)
+    span_kwargs: dict[str, Any] = {
+        "name": "vllm.model.forward",
+    }
+
+    if len(headers_list) == 1:
+        parent_ctx = extract_trace_context(headers_list[0])
+        if parent_ctx:
+            span_kwargs["context"] = parent_ctx
+    else:
+        links = []
+        for th in headers_list:
+            link = create_trace_link_otel(th)
+            if link is not None:
+                links.append(link)
+        if links:
+            span_kwargs["links"] = links
+
+    span = tracer.start_span(**span_kwargs)
+    span_attrs: dict[str, Any] = {}
+    if num_tokens is not None:
+        span_attrs["vllm.num_tokens"] = num_tokens
+    if headers_list:
+        span_attrs["vllm.batch_size"] = len(headers_list)
+    if request_ids:
+        span_attrs["vllm.request_ids"] = ",".join(request_ids)
+    if attributes:
+        span_attrs.update(attributes)
+    if span_attrs:
+        span.set_attributes(span_attrs)
+
+    with trace.use_span(span, end_on_exit=True):
+        yield
 
 
 def _get_smart_context() -> Context | None:
