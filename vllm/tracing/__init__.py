@@ -21,6 +21,7 @@ from .otel import (
     trace_model_forward_otel,
 )
 from .utils import (
+    KVTransferSpanAttributes,
     SpanAttributes,
     contains_trace_headers,
     extract_trace_headers,
@@ -34,6 +35,7 @@ __all__ = [
     "maybe_init_worker_tracer",
     "is_tracing_available",
     "SpanAttributes",
+    "KVTransferSpanAttributes",
     "SpanKind",
     "extract_trace_context",
     "extract_trace_headers",

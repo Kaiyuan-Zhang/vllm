@@ -1215,6 +1215,16 @@ class Scheduler(SchedulerInterface):
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     request.async_kv_load_start_time_ns = time.time_ns()
+                    if self.connector is not None:
+                        request.kv_backend = getattr(
+                            self.connector,
+                            "connector_name",
+                            self.connector.__class__.__name__,
+                        )
+                    request.kv_num_tokens = num_external_computed_tokens
+                    request.kv_num_blocks = (
+                        sum(len(b) for b in new_blocks) if new_blocks else None
+                    )
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until

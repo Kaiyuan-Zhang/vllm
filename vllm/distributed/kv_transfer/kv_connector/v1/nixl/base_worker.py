@@ -2848,6 +2848,35 @@ class NixlBaseConnectorWorker:
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
 
+            if getattr(meta, "transfer_start_time_ns", None):
+                from vllm.tracing import (
+                    extract_trace_context,
+                    instrument_manual,
+                    is_tracing_available,
+                )
+
+                if is_tracing_available():
+                    t1 = time.time_ns()
+                    ctx = (
+                        extract_trace_context(meta.trace_headers)
+                        if meta.trace_headers
+                        else None
+                    )
+                    instrument_manual(
+                        span_name="nixl.rdma.transfer",
+                        start_time=meta.transfer_start_time_ns,
+                        end_time=t1,
+                        context=ctx,
+                        attributes={
+                            "nixl.op": "READ",
+                            "nixl.num_blocks": len(meta.local_physical_block_ids),
+                            "nixl.remote_engine": (
+                                meta.remote.engine_id if meta.remote else None
+                            ),
+                            "request_id": req_id,
+                        },
+                    )
+
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
                 self._pending_recv_notifs.pop(req_id, None)

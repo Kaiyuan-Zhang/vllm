@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 import os
+import time
 import uuid
 from collections.abc import Generator
 from dataclasses import dataclass, field
@@ -892,6 +893,10 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
+                from vllm.tracing import instrument_manual, is_tracing_available
+
+                tracing = is_tracing_available()
+                t0 = time.time_ns() if tracing else 0
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
                     token_mask[:lmcache_cached_tokens],
@@ -906,6 +911,19 @@ class LMCacheConnectorV1Impl:
                 num_expected_tokens = (
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
+                if tracing:
+                    t1 = time.time_ns()
+                    instrument_manual(
+                        span_name="lmcache.retrieve",
+                        start_time=t0,
+                        end_time=t1,
+                        attributes={
+                            "lmcache.num_retrieved_tokens": num_retrieved_tokens,
+                            "lmcache.num_expected_tokens": num_expected_tokens,
+                            "lmcache.cached_tokens": lmcache_cached_tokens,
+                            "lmcache.req_id": request.req_id,
+                        },
+                    )
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
                         "The number of retrieved tokens is less than the "
@@ -1126,6 +1144,10 @@ class LMCacheConnectorV1Impl:
                 store_mask = store_mask[:aligned_token_len]
                 slot_mapping = slot_mapping[:aligned_token_len]
 
+            from vllm.tracing import instrument_manual, is_tracing_available
+
+            tracing = is_tracing_available()
+            t0 = time.time_ns() if tracing else 0
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
@@ -1135,6 +1157,20 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
             )
+            if tracing:
+                t1 = time.time_ns()
+                instrument_manual(
+                    span_name="lmcache.store",
+                    start_time=t0,
+                    end_time=t1,
+                    attributes={
+                        "lmcache.num_stored_tokens": (
+                            len(token_ids) - skip_leading_tokens
+                        ),
+                        "lmcache.skip_leading_tokens": skip_leading_tokens,
+                        "lmcache.req_id": request.req_id,
+                    },
+                )
 
             # NOTE(Jiayi): We assume all tokens are saved
             save_spec.skip_leading_tokens = len(token_ids)

@@ -223,6 +223,16 @@ class KVConnectorBase_V1(ABC):
     def role(self) -> KVConnectorRole:
         return self._role
 
+    @property
+    def connector_name(self) -> str:
+        """Get the name/type of this KV connector backend."""
+        if (
+            self._kv_transfer_config is not None
+            and self._kv_transfer_config.kv_connector is not None
+        ):
+            return self._kv_transfer_config.kv_connector
+        return self.__class__.__name__
+
     # ==============================
     # Worker-side methods
     # ==============================

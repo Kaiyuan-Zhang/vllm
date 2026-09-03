@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Metadata dataclasses and helpers for the NIXL connector."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -255,6 +256,8 @@ class ReqMeta:
     # Worker-only, per-region physical pages to zero after a successful pull.
     # None selects group-based completion; empty lists mean no zeroing.
     region_blocks_to_zero: BlockIds | None = None
+    trace_headers: Mapping[str, str] | None = None
+    transfer_start_time_ns: int | None = None
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -285,6 +288,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
         local_num_computed_blocks: tuple[int, ...] = (),
         awaiting_kvs: bool = False,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> ReqMeta:
         return ReqMeta(
             local_block_ids=local_block_ids,
@@ -296,6 +300,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             pp_size=kv_transfer_params.get("pp_size", 1),
             local_num_computed_blocks=local_num_computed_blocks,
             awaiting_kvs=awaiting_kvs,
+            trace_headers=trace_headers,
         )
 
     def add_new_req_to_save(
@@ -303,9 +308,12 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         request_id: ReqId,
         local_block_ids: BlockIds,
         kv_transfer_params: dict[str, Any],
+        trace_headers: Mapping[str, str] | None = None,
     ):
         self.reqs_to_save[request_id] = self._add_new_req(
-            local_block_ids, kv_transfer_params
+            local_block_ids=local_block_ids,
+            kv_transfer_params=kv_transfer_params,
+            trace_headers=trace_headers,
         )
 
     def add_new_req_to_recv(
@@ -315,12 +323,14 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
         local_num_computed_blocks: tuple[int, ...] = (),
         awaiting_kvs: bool = False,
+        trace_headers: Mapping[str, str] | None = None,
     ):
         req = self._add_new_req(
-            local_block_ids,
-            kv_transfer_params,
-            local_num_computed_blocks,
-            awaiting_kvs,
+            local_block_ids=local_block_ids,
+            kv_transfer_params=kv_transfer_params,
+            local_num_computed_blocks=local_num_computed_blocks,
+            awaiting_kvs=awaiting_kvs,
+            trace_headers=trace_headers,
         )
         req.remote = RemoteMeta(
             block_ids=kv_transfer_params["remote_block_ids"],

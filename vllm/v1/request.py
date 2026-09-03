@@ -109,6 +109,9 @@ class Request:
         self.async_kv_load_start_time_ns: int | None = None
         self.prefill_start_time_ns: int | None = None
         self.decode_start_time_ns: int | None = None
+        self.kv_backend: str | None = None
+        self.kv_num_tokens: int | None = None
+        self.kv_num_blocks: int | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -408,15 +411,33 @@ class Request:
         if self.async_kv_load_start_time_ns is None:
             return
 
+        from vllm.tracing import KVTransferSpanAttributes
+
         now = time.time_ns()
-        attributes = {"aborted": True} if aborted else None
+        attributes: dict[str, Any] = {}
+        if aborted:
+            attributes["aborted"] = True
+        if self.kv_backend is not None:
+            attributes[KVTransferSpanAttributes.KV_TRANSFER_BACKEND] = self.kv_backend
+        if self.kv_num_tokens is not None:
+            attributes[KVTransferSpanAttributes.KV_TRANSFER_NUM_TOKENS] = (
+                self.kv_num_tokens
+            )
+        if self.kv_num_blocks is not None:
+            attributes[KVTransferSpanAttributes.KV_TRANSFER_NUM_BLOCKS] = (
+                self.kv_num_blocks
+            )
+
         self.emit_span(
             "vllm.request.wait_remote_kv",
             self.async_kv_load_start_time_ns,
             now,
-            attributes,
+            attributes if attributes else None,
         )
         self.async_kv_load_start_time_ns = None
+        self.kv_backend = None
+        self.kv_num_tokens = None
+        self.kv_num_blocks = None
 
     def trace_end_prefill(self, aborted: bool = False) -> None:
         """Transition request out of prefill. Closes vllm.request.prefill span."""

@@ -53,6 +53,15 @@ class LoadingSpanAttributes:
     CODE_LINENO = "code.lineno"
 
 
+class KVTransferSpanAttributes:
+    """Attributes for KV transfer and connector tracing."""
+
+    KV_TRANSFER_BACKEND = "vllm.kv_transfer.backend"
+    KV_TRANSFER_NUM_BLOCKS = "vllm.kv_transfer.num_blocks"
+    KV_TRANSFER_NUM_TOKENS = "vllm.kv_transfer.num_tokens"
+    KV_TRANSFER_LAYER_NAME = "vllm.kv_transfer.layer_name"
+
+
 def contains_trace_headers(headers: Mapping[str, str]) -> bool:
     """Check if the provided headers dictionary contains trace context."""
     return any(h in headers for h in TRACE_HEADERS)

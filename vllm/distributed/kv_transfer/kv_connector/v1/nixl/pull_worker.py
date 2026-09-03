@@ -529,6 +529,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
 
             # Begin async xfer.
+            meta.transfer_start_time_ns = time.time_ns()
             self.nixl_wrapper.transfer(handle)
 
             # Use handle to check completion in future step().

@@ -492,6 +492,7 @@ class NixlBaseConnectorScheduler:
                 kv_transfer_params=req.kv_transfer_params,
                 local_num_computed_blocks=cached,
                 awaiting_kvs=awaiting_kvs,
+                trace_headers=req.trace_headers,
             )
 
         if self.use_host_buffer:
