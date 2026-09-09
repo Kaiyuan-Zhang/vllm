@@ -1222,8 +1222,9 @@ class Scheduler(SchedulerInterface):
                             self.connector.__class__.__name__,
                         )
                     request.kv_num_tokens = num_external_computed_tokens
+                    req_blocks = self.kv_cache_manager.get_blocks(request_id)
                     request.kv_num_blocks = (
-                        sum(len(b) for b in new_blocks.blocks) if new_blocks else None
+                        sum(len(b) for b in req_blocks.blocks) if req_blocks else None
                     )
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
