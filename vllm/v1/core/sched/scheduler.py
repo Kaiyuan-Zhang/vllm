@@ -1223,7 +1223,7 @@ class Scheduler(SchedulerInterface):
                         )
                     request.kv_num_tokens = num_external_computed_tokens
                     request.kv_num_blocks = (
-                        sum(len(b) for b in new_blocks) if new_blocks else None
+                        sum(len(b) for b in new_blocks.blocks) if new_blocks else None
                     )
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.

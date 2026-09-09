@@ -61,10 +61,15 @@ class TestKVTransferTracing:
         req.trace_end_queuing()
 
         # Simulate async KV loading transition in scheduler
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+
+        mock_blocks = KVCacheBlocks(blocks=([object()] * 8,))
         req.async_kv_load_start_time_ns = time.time_ns()
         req.kv_backend = "NixlConnector"
         req.kv_num_tokens = 128
-        req.kv_num_blocks = 8
+        req.kv_num_blocks = (
+            sum(len(b) for b in mock_blocks.blocks) if mock_blocks else None
+        )
         time.sleep(0.01)
 
         req.trace_end_kv_transfer()
@@ -84,16 +89,12 @@ class TestKVTransferTracing:
 
         # Verify KV attributes
         attrs = kv_span["attributes"]
-        backend_attr = attrs.get(
-            KVTransferSpanAttributes.KV_TRANSFER_BACKEND
-        )
+        backend_attr = attrs.get(KVTransferSpanAttributes.KV_TRANSFER_BACKEND)
         assert backend_attr == "NixlConnector"
         assert attrs.get(KVTransferSpanAttributes.KV_TRANSFER_NUM_TOKENS) == 128
         assert attrs.get(KVTransferSpanAttributes.KV_TRANSFER_NUM_BLOCKS) == 8
 
-    def test_lmcache_provider_spans(
-        self, trace_service: FakeTraceService
-    ):
+    def test_lmcache_provider_spans(self, trace_service: FakeTraceService):
         """Verify LMCache provider spans (retrieve and store) are parented to
         vllm.model.forward.
         """
@@ -150,9 +151,7 @@ class TestKVTransferTracing:
         assert store["parent_span_id"] == fwd["span_id"]
         assert retrieve["attributes"].get("lmcache.num_retrieved_tokens") == 50
 
-    def test_nixl_rdma_sibling_span(
-        self, trace_service: FakeTraceService
-    ):
+    def test_nixl_rdma_sibling_span(self, trace_service: FakeTraceService):
         """Verify NIXL RDMA span is parented to the request root span and
         runs concurrently/nested in time with wait_remote_kv."""
         arrival_time_ns = time.time_ns()
@@ -217,3 +216,22 @@ class TestKVTransferTracing:
         # RDMA timestamps are strictly within the wait_remote_kv window
         assert rdma["attributes"].get("nixl.op") == "READ"
         assert rdma["attributes"].get("nixl.num_blocks") == 16
+
+    def test_kv_cache_blocks_num_blocks_calculation(self):
+        """Verify KVCacheBlocks structure is properly unpacked to count blocks."""
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+
+        # Multi-group KV cache allocation
+        mock_blocks_group0 = [object(), object(), object()]
+        mock_blocks_group1 = [object(), object(), object(), object(), object()]
+        new_blocks = KVCacheBlocks(blocks=(mock_blocks_group0, mock_blocks_group1))
+
+        # Scheduler formula
+        kv_num_blocks = sum(len(b) for b in new_blocks.blocks) if new_blocks else None
+        assert kv_num_blocks == 8
+
+        # Verify None case
+        empty_blocks = None
+        assert (
+            sum(len(b) for b in empty_blocks.blocks) if empty_blocks else None
+        ) is None
