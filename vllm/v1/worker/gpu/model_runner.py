@@ -62,7 +62,11 @@ from vllm.multimodal.encoder_budget import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
-from vllm.tracing import trace_model_forward
+from vllm.tracing import (
+    activate_trace_fifo,
+    is_trace_fifo_available,
+    trace_model_forward,
+)
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
@@ -1923,6 +1927,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_connector.pre_forward(
                     **connector_kwargs, attn_metadata=attn_metadata
                 )
+                if is_trace_fifo_available():
+                    activate_trace_fifo(torch.cuda.current_stream().cuda_stream)
                 model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
@@ -1953,6 +1959,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 trace_headers=scheduler_output.trace_headers,
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
+                if is_trace_fifo_available():
+                    activate_trace_fifo(torch.cuda.current_stream().cuda_stream)
                 if ubatch_state is not None:
                     assert self.ubatch_runner is not None
                     model_output = self.ubatch_runner.run(

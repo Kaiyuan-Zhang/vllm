@@ -22,10 +22,14 @@ from .otel import (
 )
 from .trace_context import (
     ForwardTraceHandle,
+    activate_trace_fifo,
     clear_trace_context,
     get_active_trace_context,
     get_trace_context_ring,
+    get_trace_fifo,
     is_trace_context_available,
+    is_trace_fifo_available,
+    retire_trace_fifo,
     update_trace_context,
     update_trace_context_from_span,
 )
@@ -56,8 +60,12 @@ __all__ = [
     "trace_model_forward",
     "ForwardTraceHandle",
     "is_trace_context_available",
+    "is_trace_fifo_available",
     "get_trace_context_ring",
+    "get_trace_fifo",
     "get_active_trace_context",
+    "activate_trace_fifo",
+    "retire_trace_fifo",
     "update_trace_context",
     "update_trace_context_from_span",
     "clear_trace_context",

@@ -117,7 +117,12 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.tracing import instrument, trace_model_forward
+from vllm.tracing import (
+    activate_trace_fifo,
+    instrument,
+    is_trace_fifo_available,
+    trace_model_forward,
+)
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
@@ -3926,6 +3931,8 @@ class GPUModelRunner(
             Model output tensor
 
         """
+        if is_trace_fifo_available():
+            activate_trace_fifo(torch.cuda.current_stream().cuda_stream)
         return self.model(
             input_ids=input_ids,
             positions=positions,

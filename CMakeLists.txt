@@ -172,13 +172,27 @@ endif()
 #
 # libvllm_trace shared library for external profiler/telemetry plugins
 #
-add_library(vllm_trace SHARED csrc/tracing/trace_context.cpp)
-set_target_properties(vllm_trace PROPERTIES
-  OUTPUT_NAME "vllm_trace"
-  PREFIX "lib"
-  CXX_STANDARD 20
-  CXX_VISIBILITY_PRESET default
-)
+if(VLLM_TARGET_DEVICE STREQUAL "cuda")
+  add_library(vllm_trace SHARED csrc/tracing/trace_context.cpp csrc/tracing/trace_fifo.cu)
+  set_target_properties(vllm_trace PROPERTIES
+    OUTPUT_NAME "vllm_trace"
+    PREFIX "lib"
+    CXX_STANDARD 20
+    CUDA_STANDARD 17
+    CXX_VISIBILITY_PRESET default
+    CUDA_VISIBILITY_PRESET default
+  )
+  target_compile_definitions(vllm_trace PRIVATE -U_GNU_SOURCE -D_DEFAULT_SOURCE)
+  target_link_libraries(vllm_trace PRIVATE CUDA::cudart)
+else()
+  add_library(vllm_trace SHARED csrc/tracing/trace_context.cpp csrc/tracing/trace_fifo.cu)
+  set_target_properties(vllm_trace PROPERTIES
+    OUTPUT_NAME "vllm_trace"
+    PREFIX "lib"
+    CXX_STANDARD 20
+    CXX_VISIBILITY_PRESET default
+  )
+endif()
 install(TARGETS vllm_trace DESTINATION vllm)
 
 #
