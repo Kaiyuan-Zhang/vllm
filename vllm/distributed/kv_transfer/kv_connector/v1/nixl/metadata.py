@@ -259,7 +259,7 @@ class ReqMeta:
     trace_headers: Mapping[str, str] | None = None
     transfer_start_time_ns: int | None = None
     total_bytes: int | None = None
-    hardware_duration_us: float | None = None
+    xfer_duration_us: float | None = None
     backend: str | None = None
 
 

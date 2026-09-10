@@ -37,7 +37,6 @@ class TestKVTransferTracing:
     ):
         """Verify vllm.request.wait_remote_kv emits backend, token,
         and block attributes."""
-
         arrival_time_ns = time.time_ns()
 
         root_span, updated_headers = start_request_span(
@@ -195,7 +194,7 @@ class TestKVTransferTracing:
                 "nixl.remote_engine": "prefill-0",
                 "nixl.backend": "UCX",
                 "nixl.bytes_transferred": 1048576,
-                "nixl.hardware_duration_us": 9500.0,
+                "nixl.xfer_duration_us": 9500.0,
             },
         )
 
@@ -221,7 +220,7 @@ class TestKVTransferTracing:
         assert rdma["attributes"].get("nixl.num_blocks") == 16
         assert rdma["attributes"].get("nixl.backend") == "UCX"
         assert rdma["attributes"].get("nixl.bytes_transferred") == 1048576
-        assert rdma["attributes"].get("nixl.hardware_duration_us") == 9500.0
+        assert rdma["attributes"].get("nixl.xfer_duration_us") == 9500.0
 
     def test_kv_cache_blocks_num_blocks_calculation(self):
         """Verify KVCacheBlocks structure is properly unpacked to count blocks."""

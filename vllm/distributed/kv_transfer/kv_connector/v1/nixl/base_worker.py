@@ -2874,8 +2874,8 @@ class NixlBaseConnectorWorker:
                         attrs["nixl.backend"] = meta.backend
                     if meta.total_bytes is not None:
                         attrs["nixl.bytes_transferred"] = meta.total_bytes
-                    if meta.hardware_duration_us is not None:
-                        attrs["nixl.hardware_duration_us"] = meta.hardware_duration_us
+                    if meta.xfer_duration_us is not None:
+                        attrs["nixl.xfer_duration_us"] = meta.xfer_duration_us
 
                     instrument_manual(
                         span_name="nixl.rdma.transfer",
@@ -3062,8 +3062,8 @@ class NixlBaseConnectorWorker:
                                     ) + total_bytes
                                 duration_us = getattr(res, "xferDuration", None)
                                 if duration_us is not None:
-                                    meta.hardware_duration_us = (
-                                        meta.hardware_duration_us or 0
+                                    meta.xfer_duration_us = (
+                                        meta.xfer_duration_us or 0
                                     ) + duration_us
                         except Exception:
                             pass
