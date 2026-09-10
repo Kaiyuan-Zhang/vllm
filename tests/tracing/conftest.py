@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import socket
 import threading
 from collections.abc import Callable, Generator, Iterable
 from concurrent import futures
@@ -17,7 +19,20 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2_grpc import (
 )
 from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
 
-FAKE_TRACE_SERVER_ADDRESS = "localhost:4317"
+
+def _get_fake_trace_server_address() -> str:
+    if "FAKE_TRACE_SERVER_ADDRESS" in os.environ:
+        return os.environ["FAKE_TRACE_SERVER_ADDRESS"]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if s.connect_ex(("localhost", 4317)) != 0:
+            return "localhost:4317"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("localhost", 0))
+        port = s.getsockname()[1]
+        return f"localhost:{port}"
+
+
+FAKE_TRACE_SERVER_ADDRESS = _get_fake_trace_server_address()
 
 FieldName = Literal[
     "bool_value", "string_value", "int_value", "double_value", "array_value"

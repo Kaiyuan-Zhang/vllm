@@ -258,6 +258,9 @@ class ReqMeta:
     region_blocks_to_zero: BlockIds | None = None
     trace_headers: Mapping[str, str] | None = None
     transfer_start_time_ns: int | None = None
+    total_bytes: int | None = None
+    hardware_duration_us: float | None = None
+    backend: str | None = None
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):

@@ -2862,19 +2862,27 @@ class NixlBaseConnectorWorker:
                         if meta.trace_headers
                         else None
                     )
+                    attrs: dict[str, Any] = {
+                        "nixl.op": "READ",
+                        "nixl.num_blocks": len(meta.local_physical_block_ids),
+                        "nixl.remote_engine": (
+                            meta.remote.engine_id if meta.remote else None
+                        ),
+                        "request_id": req_id,
+                    }
+                    if meta.backend:
+                        attrs["nixl.backend"] = meta.backend
+                    if meta.total_bytes is not None:
+                        attrs["nixl.bytes_transferred"] = meta.total_bytes
+                    if meta.hardware_duration_us is not None:
+                        attrs["nixl.hardware_duration_us"] = meta.hardware_duration_us
+
                     instrument_manual(
                         span_name="nixl.rdma.transfer",
                         start_time=meta.transfer_start_time_ns,
                         end_time=t1,
                         context=ctx,
-                        attributes={
-                            "nixl.op": "READ",
-                            "nixl.num_blocks": len(meta.local_physical_block_ids),
-                            "nixl.remote_engine": (
-                                meta.remote.engine_id if meta.remote else None
-                            ),
-                            "request_id": req_id,
-                        },
+                        attributes=attrs,
                     )
 
             # Skip KV sync and post-processing for failed requests
@@ -3037,12 +3045,43 @@ class NixlBaseConnectorWorker:
         failed_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = []
+            meta = self._recving_metadata.get(req_id)
             for handle in handles:
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                     if xfer_state == "DONE":
-                        res = self.nixl_wrapper.get_xfer_telemetry(handle)
-                        self.xfer_stats.record_transfer(res)
+                        # Get telemetry from NIXL
+                        try:
+                            res = self.nixl_wrapper.get_xfer_telemetry(handle)
+                            self.xfer_stats.record_transfer(res)
+                            if meta is not None and res is not None:
+                                total_bytes = getattr(res, "totalBytes", None)
+                                if total_bytes is not None:
+                                    meta.total_bytes = (
+                                        meta.total_bytes or 0
+                                    ) + total_bytes
+                                duration_us = getattr(res, "xferDuration", None)
+                                if duration_us is not None:
+                                    meta.hardware_duration_us = (
+                                        meta.hardware_duration_us or 0
+                                    ) + duration_us
+                        except Exception:
+                            pass
+
+                        try:
+                            if meta is not None and meta.backend is None:
+                                meta.backend = self.nixl_wrapper.query_xfer_backend(
+                                    handle
+                                )
+                        except Exception:
+                            pass
+
+                        if (
+                            meta is not None
+                            and meta.backend is None
+                            and self.nixl_backends
+                        ):
+                            meta.backend = self.nixl_backends[0]
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)

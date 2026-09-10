@@ -193,6 +193,9 @@ class TestKVTransferTracing:
                 "nixl.op": "READ",
                 "nixl.num_blocks": 16,
                 "nixl.remote_engine": "prefill-0",
+                "nixl.backend": "UCX",
+                "nixl.bytes_transferred": 1048576,
+                "nixl.hardware_duration_us": 9500.0,
             },
         )
 
@@ -216,6 +219,9 @@ class TestKVTransferTracing:
         # RDMA timestamps are strictly within the wait_remote_kv window
         assert rdma["attributes"].get("nixl.op") == "READ"
         assert rdma["attributes"].get("nixl.num_blocks") == 16
+        assert rdma["attributes"].get("nixl.backend") == "UCX"
+        assert rdma["attributes"].get("nixl.bytes_transferred") == 1048576
+        assert rdma["attributes"].get("nixl.hardware_duration_us") == 9500.0
 
     def test_kv_cache_blocks_num_blocks_calculation(self):
         """Verify KVCacheBlocks structure is properly unpacked to count blocks."""
