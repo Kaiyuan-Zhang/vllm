@@ -170,6 +170,18 @@ if(Python_VERSION VERSION_GREATER_EQUAL "3.11")
 endif()
 
 #
+# libvllm_trace shared library for external profiler/telemetry plugins
+#
+add_library(vllm_trace SHARED csrc/tracing/trace_context.cpp)
+set_target_properties(vllm_trace PROPERTIES
+  OUTPUT_NAME "vllm_trace"
+  PREFIX "lib"
+  CXX_STANDARD 20
+  CXX_VISIBILITY_PRESET default
+)
+install(TARGETS vllm_trace DESTINATION vllm)
+
+#
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
 if (NOT VLLM_TARGET_DEVICE STREQUAL "cuda" AND

@@ -16,7 +16,7 @@ from vllm.tracing.utils import TRACE_HEADERS, LoadingSpanAttributes
 logger = init_logger(__name__)
 
 try:
-    from opentelemetry import trace
+    from opentelemetry import context, trace
     from opentelemetry.context.context import Context
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
         OTLPSpanExporter as OTLPGrpcExporter,
@@ -295,6 +295,8 @@ def trace_model_forward_otel(
     | None = None,
     attributes: dict[str, Any] | None = None,
     num_tokens: int | None = None,
+    step_id: int | None = None,
+    defer_end: bool = False,
 ):
     """Context manager for tracing model forward passes.
 
@@ -303,9 +305,21 @@ def trace_model_forward_otel(
     If multiple requests, links the span to all request spans.
     Sets the forward span as the active span so that inner operations
     (e.g., KV transfers, attention kernels) are parented to this forward pass.
+    Updates the process-level C trace context ring buffer for external telemetry
+    plugins. If defer_end is True, context is detached upon exit but span.end() is
+    deferred until the returned ForwardTraceHandle.end() is called
+    (e.g. at copy_event.synchronize).
     """
     if not _IS_OTEL_AVAILABLE:
-        yield
+        yield None
+        return
+
+    current_span = trace.get_current_span()
+    if (
+        current_span is not None
+        and getattr(current_span, "name", None) == "vllm.model.forward"
+    ):
+        yield getattr(current_span, "_forward_trace_handle", None)
         return
 
     # Extract valid headers list and request IDs
@@ -320,7 +334,7 @@ def trace_model_forward_otel(
         headers_list = [th for th in trace_headers if th]
 
     if not headers_list:
-        yield
+        yield None
         return
 
     tracer = _get_tracer(__name__)
@@ -349,13 +363,40 @@ def trace_model_forward_otel(
         span_attrs["vllm.batch_size"] = len(headers_list)
     if request_ids:
         span_attrs["vllm.request_ids"] = ",".join(request_ids)
+    if step_id is not None:
+        span_attrs["vllm.step_id"] = step_id
     if attributes:
         span_attrs.update(attributes)
     if span_attrs:
         span.set_attributes(span_attrs)
 
-    with trace.use_span(span, end_on_exit=True):
-        yield
+    from vllm.tracing.trace_context import (
+        ForwardTraceHandle,
+        update_trace_context_from_span,
+    )
+
+    otel_ctx = trace.set_span_in_context(span)
+    token = context.attach(otel_ctx)
+
+    update_trace_context_from_span(span, step_id=step_id or 0)
+
+    handle = ForwardTraceHandle(
+        span=span,
+        token=token,
+        step_id=step_id or 0,
+    )
+    span._forward_trace_handle = handle
+
+    try:
+        yield handle
+    except Exception:
+        handle.end()
+        raise
+    finally:
+        if not defer_end:
+            handle.end()
+        else:
+            handle.detach_context()
 
 
 def _get_smart_context() -> Context | None:

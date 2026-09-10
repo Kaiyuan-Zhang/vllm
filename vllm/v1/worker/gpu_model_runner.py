@@ -117,7 +117,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.tracing import instrument
+from vllm.tracing import instrument, trace_model_forward
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
@@ -297,9 +297,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         routed_experts: RoutedExpertsTensors | None = None,
         check_ep_fault: bool = False,
         num_nans: torch.Tensor | None = None,
+        forward_trace_handle: Any = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
+        self.forward_trace_handle = forward_trace_handle
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
@@ -348,6 +350,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
         self.async_copy_ready_event.synchronize()
+        if self.forward_trace_handle is not None:
+            self.forward_trace_handle.end()
+            self.forward_trace_handle = None
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -392,6 +397,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             )
 
         return output
+
+    def __del__(self) -> None:
+        if getattr(self, "forward_trace_handle", None) is not None:
+            self.forward_trace_handle.end()
+            self.forward_trace_handle = None
 
 
 def _copy_pooler_output_to_cpu(
@@ -446,8 +456,10 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         raw_pooler_output: PoolerOutput,
         finished_mask: list[bool],
         async_output_copy_stream: torch.cuda.Stream,
+        forward_trace_handle: Any = None,
     ):
         self._model_runner_output = model_runner_output
+        self.forward_trace_handle = forward_trace_handle
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
@@ -472,10 +484,20 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         self.async_copy_ready_event.synchronize()
+        if self.forward_trace_handle is not None:
+            self.forward_trace_handle.end()
+            self.forward_trace_handle = None
 
         # Release the device tensors once the copy has completed.
         del self._raw_pooler_output
         return self._model_runner_output
+
+    def __del__(self) -> None:
+        if getattr(self, "forward_trace_handle", None) is not None:
+            self.forward_trace_handle.end()
+            self.forward_trace_handle = None
+        if hasattr(self, "_raw_pooler_output"):
+            del self._raw_pooler_output
 
 
 class ExecuteModelState(NamedTuple):
@@ -492,6 +514,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    forward_trace_handle: Any = None
 
 
 class GPUModelRunner(
@@ -986,6 +1009,7 @@ class GPUModelRunner(
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
+        self.step_id: int = 0
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
@@ -3445,6 +3469,7 @@ class GPUModelRunner(
         num_scheduled_tokens: int,
         num_scheduled_tokens_np: np.ndarray,
         kv_connector_output: KVConnectorOutput | None,
+        forward_trace_handle: Any = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs == len(self.input_batch.pooling_params), (
@@ -3483,6 +3508,8 @@ class GPUModelRunner(
 
         if raw_pooler_output is None or not any(finished_mask):
             self._sync_device()
+            if forward_trace_handle is not None:
+                forward_trace_handle.end()
             model_runner_output.pooler_output = [None] * num_reqs
             return model_runner_output
 
@@ -3493,6 +3520,8 @@ class GPUModelRunner(
                 finished_mask=finished_mask,
             )
             self._sync_device()
+            if forward_trace_handle is not None:
+                forward_trace_handle.end()
             return model_runner_output
 
         return AsyncGPUPoolingModelRunnerOutput(
@@ -3500,6 +3529,7 @@ class GPUModelRunner(
             raw_pooler_output=raw_pooler_output,
             finished_mask=finished_mask,
             async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
+            forward_trace_handle=forward_trace_handle,
         )
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
@@ -4460,7 +4490,14 @@ class GPUModelRunner(
                 ubatch_slices_padded,
             )
         is_padding = self._prepare_padding_mask(num_tokens_unpadded, num_tokens_padded)
+        self.step_id += 1
         with (
+            trace_model_forward(
+                trace_headers=scheduler_output.trace_headers,
+                num_tokens=num_tokens_padded,
+                step_id=self.step_id,
+                defer_end=True,
+            ) as forward_trace_handle,
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -4503,6 +4540,8 @@ class GPUModelRunner(
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     self.kv_connector_output = kv_connector_output
+                    if forward_trace_handle is not None:
+                        forward_trace_handle.end()
                     return hidden_states
 
                 if self.is_pooling_model:
@@ -4512,6 +4551,7 @@ class GPUModelRunner(
                         num_scheduled_tokens,
                         num_scheduled_tokens_np,
                         kv_connector_output,
+                        forward_trace_handle=forward_trace_handle,
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -4557,6 +4597,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            forward_trace_handle,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4608,6 +4649,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            forward_trace_handle,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -4814,6 +4856,8 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
+            if forward_trace_handle is not None:
+                forward_trace_handle.end()
             if self.routed_experts_initialized:
                 # Sync path: D2H was issued in ``_bookkeeping_sync`` and
                 # synchronized by ``_to_list``'s event.synchronize(), so
@@ -4853,6 +4897,7 @@ class GPUModelRunner(
                 routed_experts=routed_experts_snapshot,
                 check_ep_fault=self.check_ep_fault,
                 num_nans=num_nans_device,
+                forward_trace_handle=forward_trace_handle,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"

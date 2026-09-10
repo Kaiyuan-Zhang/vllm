@@ -20,6 +20,15 @@ from .otel import (
     start_request_span_otel,
     trace_model_forward_otel,
 )
+from .trace_context import (
+    ForwardTraceHandle,
+    clear_trace_context,
+    get_active_trace_context,
+    get_trace_context_ring,
+    is_trace_context_available,
+    update_trace_context,
+    update_trace_context_from_span,
+)
 from .utils import (
     KVTransferSpanAttributes,
     SpanAttributes,
@@ -45,6 +54,13 @@ __all__ = [
     "start_request_span",
     "create_trace_link",
     "trace_model_forward",
+    "ForwardTraceHandle",
+    "is_trace_context_available",
+    "get_trace_context_ring",
+    "get_active_trace_context",
+    "update_trace_context",
+    "update_trace_context_from_span",
+    "clear_trace_context",
 ]
 
 BackendAvailableFunc: TypeAlias = Callable[[], bool]
@@ -214,19 +230,30 @@ def trace_model_forward(
     trace_headers: Any = None,
     attributes: dict[str, Any] | None = None,
     num_tokens: int | None = None,
+    step_id: int | None = None,
+    defer_end: bool = False,
 ):
     """Context manager for tracing model forward passes.
 
     Creates a 'vllm.model.forward' span representing forward pass execution,
     sets it as current span so inner operations (KV transfer, kernels) are
-    properly parented, and links it to the active requests.
+    properly parented, links it to the active requests, and updates the process-level
+    C trace context ring buffer for external plugins.
+    If defer_end is True, context is detached upon exit but span.end() is deferred
+    until the returned ForwardTraceHandle.end() is called.
     """
     backend = _REGISTERED_TRACING_BACKENDS.get("otel")
     if backend and backend.is_available():
-        with backend.trace_model_forward(trace_headers, attributes, num_tokens):
-            yield
+        with backend.trace_model_forward(
+            trace_headers=trace_headers,
+            attributes=attributes,
+            num_tokens=num_tokens,
+            step_id=step_id,
+            defer_end=defer_end,
+        ) as handle:
+            yield handle
     else:
-        yield
+        yield None
 
 
 def is_tracing_available() -> bool:

@@ -347,6 +347,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self.step_id: int = 0
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -1905,6 +1906,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             request_ids=input_batch.req_ids,
             num_tokens=input_batch.num_tokens,
         )
+        self.step_id += 1
+        forward_trace_handle = None
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -1914,7 +1917,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             with trace_model_forward(
                 trace_headers=scheduler_output.trace_headers,
                 num_tokens=input_batch.num_tokens_after_padding,
-            ):
+                step_id=self.step_id,
+                defer_end=True,
+            ) as forward_trace_handle:
                 self.kv_connector.pre_forward(
                     **connector_kwargs, attn_metadata=attn_metadata
                 )
@@ -1927,7 +1932,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_active_loras=batch_desc.num_active_loras,
             )
 
-            with set_forward_context(
+            with trace_model_forward(
+                trace_headers=scheduler_output.trace_headers,
+                num_tokens=input_batch.num_tokens_after_padding,
+                step_id=self.step_id,
+                defer_end=True,
+            ) as forward_trace_handle, set_forward_context(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,
@@ -1994,10 +2004,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
             cudagraph_stats=cudagraph_stats,
+            forward_trace_handle=forward_trace_handle,
         )
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
+            if forward_trace_handle is not None:
+                forward_trace_handle.end()
             assert output_intermediate_tensors is not None
             assert self.pp_handler is not None
             return self.pp_handler.relay_aux_hidden_states(
@@ -2024,9 +2037,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
         cudagraph_stats = self.execute_model_state.cudagraph_stats
+        forward_trace_handle = self.execute_model_state.forward_trace_handle
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
+            if forward_trace_handle is not None:
+                forward_trace_handle.end()
             # Non-last PP rank: hidden_states is None because this rank produced
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
@@ -2100,6 +2116,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
+            forward_trace_handle=forward_trace_handle,
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -2207,12 +2224,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
+        forward_trace_handle = self.execute_model_state.forward_trace_handle
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
 
         if not self.is_last_pp_rank:
+            if forward_trace_handle is not None:
+                forward_trace_handle.end()
             self.postprocess_num_computed_tokens(input_batch)
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
@@ -2235,6 +2255,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_mask=finished_mask,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
+            forward_trace_handle=forward_trace_handle,
         )
 
         self.postprocess_num_computed_tokens(input_batch)
@@ -2326,6 +2347,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     routed_experts: RoutedExpertsTensors | None
     cudagraph_stats: CUDAGraphStat | None
+    forward_trace_handle: Any = None
 
 
 class BatchReqState(NamedTuple):

@@ -3,7 +3,7 @@
 import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -122,6 +122,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
+        forward_trace_handle: Any = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -130,6 +131,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.routed_experts = routed_experts
+        self.forward_trace_handle = forward_trace_handle
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
@@ -166,6 +168,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
+        if self.forward_trace_handle is not None:
+            self.forward_trace_handle.end()
+            self.forward_trace_handle = None
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
@@ -205,6 +210,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
 
         return self.model_runner_output
 
+    def __del__(self) -> None:
+        if getattr(self, "forward_trace_handle", None) is not None:
+            self.forward_trace_handle.end()
+            self.forward_trace_handle = None
+
 
 class AsyncPoolingOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -214,9 +224,11 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         finished_mask: list[bool],
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
+        forward_trace_handle: Any = None,
     ):
         self.model_runner_output = model_runner_output
         self.pooler_output = pooler_output
+        self.forward_trace_handle = forward_trace_handle
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
 
@@ -246,8 +258,16 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         else:
             pooler_output = self.pooler_output_cpu
         self.copy_event.synchronize()
+        if self.forward_trace_handle is not None:
+            self.forward_trace_handle.end()
+            self.forward_trace_handle = None
         self.model_runner_output.pooler_output = pooler_output
         return self.model_runner_output
+
+    def __del__(self) -> None:
+        if getattr(self, "forward_trace_handle", None) is not None:
+            self.forward_trace_handle.end()
+            self.forward_trace_handle = None
 
 
 def async_copy_to_np(x: torch.Tensor) -> np.ndarray:
