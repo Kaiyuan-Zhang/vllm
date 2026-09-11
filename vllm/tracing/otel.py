@@ -5,6 +5,7 @@ import atexit
 import functools
 import inspect
 import os
+import secrets
 import traceback
 from collections.abc import Mapping
 from contextlib import contextmanager, suppress
@@ -31,6 +32,7 @@ try:
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.trace.id_generator import IdGenerator
     from opentelemetry.trace import (
         SpanKind,  # noqa: F401
         Tracer,
@@ -42,6 +44,29 @@ try:
 
     _IS_OTEL_AVAILABLE = True
     otel_import_error_traceback = None
+
+
+    class SecretsIdGenerator(IdGenerator):
+        """An ID generator that draws from Python's `secrets` module (CSPRNG)
+        instead of the standard library `random` module. This prevents span ID
+        and trace ID collisions across multi-process tensor-parallel workers
+        where Python's `random.seed()` is deterministically synchronized.
+        """
+
+        def generate_span_id(self) -> int:
+            span_id = secrets.randbits(64)
+            while span_id == trace.INVALID_SPAN_ID:
+                span_id = secrets.randbits(64)
+            return span_id
+
+        def generate_trace_id(self) -> int:
+            trace_id = secrets.randbits(128)
+            while trace_id == trace.INVALID_TRACE_ID:
+                trace_id = secrets.randbits(128)
+            return trace_id
+
+        def is_trace_id_random(self) -> bool:
+            return True
 except ImportError:
     _IS_OTEL_AVAILABLE = False
     otel_import_error_traceback = traceback.format_exc()
@@ -89,7 +114,10 @@ def init_otel_tracer(
         resource_attrs.update(extra_attributes)
     resource = Resource.create(resource_attrs)
 
-    trace_provider = TracerProvider(resource=resource)
+    trace_provider = TracerProvider(
+        resource=resource,
+        id_generator=SecretsIdGenerator(),
+    )
     span_exporter = get_span_exporter(otlp_traces_endpoint)
     trace_provider.add_span_processor(BatchSpanProcessor(span_exporter))
     with suppress(Exception):
@@ -119,12 +147,17 @@ def get_span_exporter(endpoint: str):
     return exporter
 
 
+_CURRENT_PROCESS_NAME: str | None = None
+
+
 def init_otel_worker_tracer(
     instrumenting_module_name: str,
     process_kind: str,
     process_name: str,
 ) -> Tracer:
     """Backend-specific initialization for OpenTelemetry in a worker process."""
+    global _CURRENT_PROCESS_NAME
+    _CURRENT_PROCESS_NAME = process_name
     # Initialize the tracer if an OTLP endpoint is configured.
     # The endpoint is propagated via environment variable from the main process.
     otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
@@ -261,6 +294,7 @@ def start_request_span_otel(
         (span, trace_headers): The active span object and a dict of W3C
         trace headers (e.g. {'traceparent': ...}) representing this span's
         context for propagation to downstream workers/subsystems.
+
     """
     if not _IS_OTEL_AVAILABLE:
         return None, None
@@ -365,6 +399,11 @@ def trace_model_forward_otel(
         span_attrs["vllm.request_ids"] = ",".join(request_ids)
     if step_id is not None:
         span_attrs["vllm.step_id"] = step_id
+    if _CURRENT_PROCESS_NAME:
+        span_attrs["vllm.process_name"] = _CURRENT_PROCESS_NAME
+        if _CURRENT_PROCESS_NAME.startswith("Worker_"):
+            with suppress(ValueError, IndexError):
+                span_attrs["vllm.rank"] = int(_CURRENT_PROCESS_NAME.split("_")[-1])
     if attributes:
         span_attrs.update(attributes)
     if span_attrs:
