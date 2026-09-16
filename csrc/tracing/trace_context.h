@@ -68,11 +68,24 @@ __attribute__((visibility("default")))
 void vllm_trace_context_clear(void);
 
 /**
+ * Retires a finished step in the trace FIFO and ring buffer without resetting cursors.
+ */
+__attribute__((visibility("default")))
+void vllm_trace_context_retire(uint64_t step_id);
+
+/**
  * Helper to copy the currently active trace context into out_ctx.
  * Returns 1 if an active valid context is present, 0 otherwise.
  */
 __attribute__((visibility("default")))
 int vllm_trace_context_get_active(vllmTraceContext_t* out_ctx);
+
+/**
+ * Looks up active trace context by GPU timestamp (%globaltimer).
+ * Falls back to get_active if timestamp matching is not found.
+ */
+__attribute__((visibility("default")))
+int vllm_trace_context_find_by_timestamp(uint64_t ptimer, vllmTraceContext_t* out_ctx);
 
 #ifdef __cplusplus
 }

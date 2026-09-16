@@ -29,7 +29,11 @@ __global__ void vllm_trace_fifo_activate_kernel(vllmTraceFifo_t* dev_fifo) {
     );
 
     if (old_status == (unsigned int)VLLM_SLOT_DATA_READY) {
+        uint64_t ts;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
+        slot->gpu_start_ts = ts;
         dev_fifo->active_idx = slot_idx;
+        __threadfence_system();
         atomicAdd_system((unsigned long long*)&dev_fifo->commit_head, 1ULL);
     }
 }
@@ -80,6 +84,7 @@ void vllm_trace_fifo_enqueue(
     slot->trace_id_lo = trace_id_lo;
     slot->parent_span_id = parent_span_id;
     slot->step_id = step_id;
+    slot->gpu_start_ts = 0;
     slot->trace_flags = trace_flags;
 
     std::atomic_thread_fence(std::memory_order_release);
@@ -107,6 +112,7 @@ void vllm_trace_fifo_activate(void* stream) {
     vllmFifoSlot_t* slot = &fifo->slots[slot_idx];
     if (slot->status == VLLM_SLOT_DATA_READY) {
         slot->status = VLLM_SLOT_IN_USE;
+        slot->gpu_start_ts = 0;
         fifo->active_idx = slot_idx;
         fifo->commit_head = commit + 1;
     }
@@ -119,7 +125,7 @@ void vllm_trace_fifo_retire(uint64_t step_id) {
     if (!fifo) return;
     for (uint32_t i = 0; i < fifo->capacity; i++) {
         if (fifo->slots[i].step_id == step_id && fifo->slots[i].status == VLLM_SLOT_IN_USE) {
-            fifo->slots[i].status = VLLM_SLOT_EMPTY;
+            fifo->slots[i].status = VLLM_SLOT_COMPLETED;
             break;
         }
     }
@@ -145,6 +151,49 @@ int vllm_trace_fifo_get_active(vllmFifoSlot_t* out_slot) {
         uint32_t v2 = slot->version;
         if (v1 == v2 && out_slot->status == VLLM_SLOT_IN_USE) {
             return 1;
+        }
+    }
+    return 0;
+}
+
+__attribute__((visibility("default")))
+int vllm_trace_fifo_find_by_timestamp(uint64_t ptimer, vllmFifoSlot_t* out_slot) {
+    vllmTraceFifo_t* fifo = vllm_trace_fifo_global();
+    if (!fifo || !out_slot || ptimer == 0) return 0;
+
+    uint64_t commit = fifo->commit_head;
+    if (commit == 0) return 0;
+
+    uint64_t max_lookback = fifo->capacity;
+    if (commit < max_lookback) max_lookback = commit;
+
+    for (uint64_t offset = 0; offset < max_lookback; offset++) {
+        uint32_t slot_idx = (uint32_t)((commit - 1 - offset) % fifo->capacity);
+        vllmFifoSlot_t* slot = &fifo->slots[slot_idx];
+
+        for (int retry = 0; retry < 3; retry++) {
+            uint32_t v1 = slot->version;
+            if (v1 & 1) continue;
+            std::atomic_thread_fence(std::memory_order_acquire);
+
+            vllmFifoSlot_t cand = *slot;
+
+            std::atomic_thread_fence(std::memory_order_acquire);
+            uint32_t v2 = slot->version;
+            if (v1 != v2) continue;
+
+            if (cand.status != VLLM_SLOT_IN_USE && cand.status != VLLM_SLOT_COMPLETED) {
+                break;
+            }
+            if (cand.gpu_start_ts == 0) {
+                break;
+            }
+
+            if (cand.gpu_start_ts <= ptimer && (ptimer - cand.gpu_start_ts) <= 5000000000ULL) {
+                *out_slot = cand;
+                return 1;
+            }
+            break;
         }
     }
     return 0;

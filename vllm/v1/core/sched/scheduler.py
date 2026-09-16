@@ -4,6 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import replace
 from typing import Any
 
@@ -32,7 +33,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
-from vllm.tracing import is_tracing_available
+from vllm.tracing import is_tracing_available, start_step_span
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
@@ -377,6 +378,7 @@ class Scheduler(SchedulerInterface):
         # FIFO of (fence_seq, blocks): blocks become safe to free once
         # processed_step_seq >= fence_seq.
         self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
+        self._step_spans: dict[int, Any] = {}
 
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -1427,8 +1429,9 @@ class Scheduler(SchedulerInterface):
             )
 
         trace_headers = None
+        step_span = None
         if is_tracing_available():
-            trace_headers = {
+            req_trace_headers = {
                 req.request_id: req.trace_headers
                 for req in itertools.chain(
                     scheduled_new_reqs,
@@ -1437,8 +1440,13 @@ class Scheduler(SchedulerInterface):
                 )
                 if req.trace_headers is not None
             }
-            if not trace_headers:
-                trace_headers = None
+            if req_trace_headers:
+                step_span, carrier = start_step_span(
+                    trace_headers=req_trace_headers,
+                    step_id=self.sched_step_seq + 1,
+                    num_tokens=total_num_scheduled_tokens,
+                )
+                trace_headers = carrier
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -1464,6 +1472,13 @@ class Scheduler(SchedulerInterface):
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
             trace_headers=trace_headers,
         )
+
+        if step_span is not None:
+            self._step_spans[id(scheduler_output)] = step_span
+            while len(self._step_spans) > 256:
+                _, old_span = self._step_spans.popitem()
+                with suppress(Exception):
+                    old_span.end()
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1913,6 +1928,11 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if self._step_spans:
+            step_span = self._step_spans.pop(id(scheduler_output), None)
+            if step_span is not None:
+                step_span.end()
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -2903,6 +2923,12 @@ class Scheduler(SchedulerInterface):
 
         if self.ec_connector is not None:
             self.ec_connector.shutdown()
+
+        if hasattr(self, "_step_spans"):
+            while self._step_spans:
+                _, span = self._step_spans.popitem()
+                with suppress(Exception):
+                    span.end()
 
         logger.debug_once("[shutdown] Scheduler: complete")
 

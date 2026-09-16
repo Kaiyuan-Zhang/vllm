@@ -18,6 +18,7 @@ from .otel import (
     manual_instrument_otel,
     otel_import_error_traceback,
     start_request_span_otel,
+    start_step_span_otel,
     trace_model_forward_otel,
 )
 from .trace_context import (
@@ -56,6 +57,7 @@ __all__ = [
     "contains_trace_headers",
     "otel_import_error_traceback",
     "start_request_span",
+    "start_step_span",
     "create_trace_link",
     "trace_model_forward",
     "ForwardTraceHandle",
@@ -76,6 +78,7 @@ BackendAvailableFunc: TypeAlias = Callable[[], bool]
 InstrumentFunc: TypeAlias = Callable[..., Any]
 InstrumentManualFunc: TypeAlias = Callable[..., Any]
 StartRequestSpanFunc: TypeAlias = Callable[..., Any]
+StartStepSpanFunc: TypeAlias = Callable[..., Any]
 InitTracerFunc: TypeAlias = Callable[..., Any]
 InitWorkerTracerFunc: TypeAlias = Callable[..., Any]
 CreateTraceLinkFunc: TypeAlias = Callable[..., Any]
@@ -89,6 +92,7 @@ class TracingBackend(NamedTuple):
     instrument: InstrumentFunc
     manual_instrument: InstrumentManualFunc
     start_request_span: StartRequestSpanFunc
+    start_step_span: StartStepSpanFunc
     create_trace_link: CreateTraceLinkFunc
     trace_model_forward: TraceModelForwardFunc
 
@@ -101,6 +105,7 @@ _REGISTERED_TRACING_BACKENDS: dict[str, TracingBackend] = {
         instrument=instrument_otel,
         manual_instrument=manual_instrument_otel,
         start_request_span=start_request_span_otel,
+        start_step_span=start_step_span_otel,
         create_trace_link=create_trace_link_otel,
         trace_model_forward=trace_model_forward_otel,
     ),
@@ -216,6 +221,44 @@ def start_request_span(
         return None, None
 
 
+def start_step_span(
+    trace_headers: Any = None,
+    step_id: int | None = None,
+    num_tokens: int | None = None,
+    attributes: dict[str, Any] | None = None,
+) -> tuple[Any, dict[str, str] | None]:
+    """Start a parent span representing an engine execution step.
+
+    Creates 'vllm.scheduler.step' linked to all request traces in the scheduled batch,
+    and returns the span along with a single W3C trace context carrier
+    ({"traceparent": ...}) to propagate to workers over IPC (~55 bytes instead of
+    full request headers).
+
+    Args:
+        trace_headers: Map of {req_id: carrier_dict} or list of carrier dicts
+            from scheduled requests.
+        step_id: Engine step counter / sequence.
+        num_tokens: Total scheduled tokens for this step.
+        attributes: Additional span attributes.
+
+    Returns:
+        tuple (span, carrier): The open step span object (to be ended when step
+        completes in update_from_output) and a single carrier dict to serialize
+        in SchedulerOutput.trace_headers.
+
+    """
+    backend = _REGISTERED_TRACING_BACKENDS.get("otel")
+    if backend and backend.is_available():
+        return backend.start_step_span(
+            trace_headers=trace_headers,
+            step_id=step_id,
+            num_tokens=num_tokens,
+            attributes=attributes,
+        )
+    else:
+        return None, None
+
+
 def create_trace_link(trace_headers: dict[str, str] | None) -> Any:
     """Create an OpenTelemetry Link from W3C trace headers.
 
@@ -239,6 +282,7 @@ def trace_model_forward(
     attributes: dict[str, Any] | None = None,
     num_tokens: int | None = None,
     step_id: int | None = None,
+    is_dummy: bool = False,
     defer_end: bool = False,
 ):
     """Context manager for tracing model forward passes.
@@ -257,6 +301,7 @@ def trace_model_forward(
             attributes=attributes,
             num_tokens=num_tokens,
             step_id=step_id,
+            is_dummy=is_dummy,
             defer_end=defer_end,
         ) as handle:
             yield handle

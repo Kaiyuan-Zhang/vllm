@@ -3,10 +3,11 @@
 
 """vLLM Trace Context Exporter for in-process telemetry / profiler plugins.
 
-Exposes an OpenTelemetry trace context ring buffer into host memory and exports
-`vllm_trace_context_ring` as a global C symbol (`RTLD_GLOBAL`), allowing external
-plugins such as NCCL profiler plugins and DeepEP to discover the active forward pass
-trace context without compile-time coupling to vLLM.
+Exposes an OpenTelemetry trace context ring buffer and lock-free 2048-slot GPU
+FIFO (128 KB host-pinned memory) to external plugins (e.g. NCCL, DeepEP).
+Maintains VLLM_SLOT_COMPLETED state upon span retirement for historical hardware
+timestamp lookups, and supports dummy run correlation (trace_id=0) for DP/EP
+coordination across tensor-parallel worker ranks.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-VLLM_TRACE_FIFO_CAPACITY = 64
+VLLM_TRACE_FIFO_CAPACITY = 2048
 VLLM_TRACE_CONTEXT_RING_CAPACITY = 64
 
 
@@ -35,8 +36,9 @@ class VllmFifoSlot(ctypes.Structure):
         ("trace_id_lo", ctypes.c_uint64),
         ("parent_span_id", ctypes.c_uint64),
         ("step_id", ctypes.c_uint64),
+        ("gpu_start_ts", ctypes.c_uint64),
         ("trace_flags", ctypes.c_uint8),
-        ("_pad", ctypes.c_uint8 * 23),
+        ("_pad", ctypes.c_uint8 * 15),
     ]
 
     def to_dict(self) -> dict[str, Any]:
@@ -47,6 +49,7 @@ class VllmFifoSlot(ctypes.Structure):
             "trace_id": f"{trace_id:032x}",
             "parent_span_id": f"{self.parent_span_id:016x}",
             "step_id": self.step_id,
+            "gpu_start_ts": self.gpu_start_ts,
             "trace_flags": self.trace_flags,
         }
 
@@ -203,6 +206,10 @@ def _setup_lib_signatures(lib: ctypes.CDLL) -> None:
         lib.vllm_trace_context_clear.restype = None
         lib.vllm_trace_context_clear.argtypes = []
 
+    if hasattr(lib, "vllm_trace_context_retire"):
+        lib.vllm_trace_context_retire.restype = None
+        lib.vllm_trace_context_retire.argtypes = [ctypes.c_uint64]
+
     if hasattr(lib, "vllm_trace_context_get_active"):
         lib.vllm_trace_context_get_active.restype = ctypes.c_int
         lib.vllm_trace_context_get_active.argtypes = [ctypes.POINTER(VllmTraceContext)]
@@ -233,6 +240,20 @@ def _setup_lib_signatures(lib: ctypes.CDLL) -> None:
     if hasattr(lib, "vllm_trace_fifo_get_active"):
         lib.vllm_trace_fifo_get_active.restype = ctypes.c_int
         lib.vllm_trace_fifo_get_active.argtypes = [ctypes.POINTER(VllmFifoSlot)]
+
+    if hasattr(lib, "vllm_trace_fifo_find_by_timestamp"):
+        lib.vllm_trace_fifo_find_by_timestamp.restype = ctypes.c_int
+        lib.vllm_trace_fifo_find_by_timestamp.argtypes = [
+            ctypes.c_uint64,
+            ctypes.POINTER(VllmFifoSlot),
+        ]
+
+    if hasattr(lib, "vllm_trace_context_find_by_timestamp"):
+        lib.vllm_trace_context_find_by_timestamp.restype = ctypes.c_int
+        lib.vllm_trace_context_find_by_timestamp.argtypes = [
+            ctypes.c_uint64,
+            ctypes.POINTER(VllmTraceContext),
+        ]
 
     if hasattr(lib, "vllm_trace_fifo_reset"):
         lib.vllm_trace_fifo_reset.restype = None
@@ -289,12 +310,40 @@ def get_active_trace_context() -> VllmTraceContext | None:
 
 
 def get_active_trace_fifo() -> VllmFifoSlot | None:
-    """Returns the currently active GPU FIFO slot (status == IN_USE), or None."""
+    """Returns currently active GPU FIFO slot (IN_USE or COMPLETED), or None."""
     if _trace_lib is None or not hasattr(_trace_lib, "vllm_trace_fifo_get_active"):
         return None
     slot = VllmFifoSlot()
     if _trace_lib.vllm_trace_fifo_get_active(ctypes.byref(slot)):
         return slot
+    return None
+
+
+def find_trace_fifo_slot_by_timestamp(ptimer: int) -> VllmFifoSlot | None:
+    """Finds the FIFO slot matching the given GPU timestamp (%globaltimer)."""
+    if _trace_lib is None or not hasattr(
+        _trace_lib, "vllm_trace_fifo_find_by_timestamp"
+    ):
+        return None
+    slot = VllmFifoSlot()
+    if _trace_lib.vllm_trace_fifo_find_by_timestamp(
+        ctypes.c_uint64(ptimer), ctypes.byref(slot)
+    ):
+        return slot
+    return None
+
+
+def find_trace_context_by_timestamp(ptimer: int) -> VllmTraceContext | None:
+    """Finds the trace context matching the given GPU timestamp (%globaltimer)."""
+    if _trace_lib is None or not hasattr(
+        _trace_lib, "vllm_trace_context_find_by_timestamp"
+    ):
+        return None
+    ctx = VllmTraceContext()
+    if _trace_lib.vllm_trace_context_find_by_timestamp(
+        ctypes.c_uint64(ptimer), ctypes.byref(ctx)
+    ):
+        return ctx
     return None
 
 
@@ -306,10 +355,24 @@ def activate_trace_fifo(stream: int | None = None) -> None:
 
 
 def retire_trace_fifo(step_id: int) -> None:
-    """Retires a finished step in the trace FIFO upon CPU completion sync."""
-    if _trace_lib is None or not hasattr(_trace_lib, "vllm_trace_fifo_retire"):
+    """Retires a finished step in the trace FIFO to VLLM_SLOT_COMPLETED.
+
+    Retains the completed slot in the circular buffer for asynchronous
+    historical timestamp lookups by external profilers.
+    """
+    if _trace_lib is None:
         return
-    _trace_lib.vllm_trace_fifo_retire(ctypes.c_uint64(step_id))
+    if hasattr(_trace_lib, "vllm_trace_context_retire"):
+        _trace_lib.vllm_trace_context_retire(ctypes.c_uint64(step_id))
+    elif hasattr(_trace_lib, "vllm_trace_fifo_retire"):
+        _trace_lib.vllm_trace_fifo_retire(ctypes.c_uint64(step_id))
+
+
+def reset_trace_fifo() -> None:
+    """Resets all heads and slots in the GPU trace FIFO."""
+    if _trace_lib is None or not hasattr(_trace_lib, "vllm_trace_fifo_reset"):
+        return
+    _trace_lib.vllm_trace_fifo_reset()
 
 
 def update_trace_context(
@@ -318,7 +381,12 @@ def update_trace_context(
     step_id: int = 0,
     trace_flags: int = 1,
 ) -> None:
-    """Updates the ring buffer and enqueues into the GPU trace FIFO."""
+    """Updates the ring buffer and enqueues into the GPU trace FIFO.
+
+    Supports trace_id=0 (parent_span_id=0, trace_flags=0) to denote dummy
+    forward executions for DP/EP synchronization, ensuring collectives
+    advance commit_head and avoid misattribution to previous real steps.
+    """
     if _trace_lib is None:
         return
     trace_id_hi = (trace_id >> 64) & 0xFFFFFFFFFFFFFFFF
@@ -385,8 +453,7 @@ class ForwardTraceHandle:
             self.token = None
 
     def end(self) -> None:
-        """Ends the forward span, retires the FIFO slot,
-        and clears the active context."""
+        """Ends the forward span and retires the trace context."""
         if self._ended:
             return
         self._ended = True
@@ -396,7 +463,6 @@ class ForwardTraceHandle:
                 self.span.end()
         if self.step_id:
             retire_trace_fifo(self.step_id)
-        clear_trace_context()
 
     def __enter__(self) -> ForwardTraceHandle:
         return self

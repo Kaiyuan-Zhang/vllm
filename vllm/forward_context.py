@@ -284,7 +284,10 @@ def set_forward_context(
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
     trace_headers: (
-        Mapping[str, Mapping[str, str]] | list[Mapping[str, str]] | None
+        Mapping[str, str]
+        | Mapping[str, Mapping[str, str]]
+        | list[Mapping[str, str]]
+        | None
     ) = None,
 ):
     """A context manager that stores the current forward context,

@@ -304,9 +304,10 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
-    # Trace headers mapping (req_id -> trace_headers) for scheduled requests.
-    # Propagated to workers for model forward pass and KV transfer tracing.
-    trace_headers: dict[str, Mapping[str, str]] | None = None
+    # W3C trace context carrier ({"traceparent": ...}) for the scheduled step's
+    # parent span (vllm.scheduler.step). Propagated to workers for model forward
+    # pass and GPU collective telemetry (~55 bytes instead of full request dict).
+    trace_headers: Mapping[str, str] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

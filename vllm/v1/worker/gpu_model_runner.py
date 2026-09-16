@@ -4503,6 +4503,7 @@ class GPUModelRunner(
                 trace_headers=scheduler_output.trace_headers,
                 num_tokens=num_tokens_padded,
                 step_id=self.step_id,
+                is_dummy=False,
                 defer_end=True,
             ) as forward_trace_handle,
             set_forward_context(

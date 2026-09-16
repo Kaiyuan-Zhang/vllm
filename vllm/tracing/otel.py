@@ -322,28 +322,148 @@ def start_request_span_otel(
     return span, carrier
 
 
+def start_step_span_otel(
+    trace_headers: Mapping[str, Mapping[str, str]]
+    | list[Mapping[str, str]]
+    | None = None,
+    step_id: int | None = None,
+    num_tokens: int | None = None,
+    attributes: dict[str, Any] | None = None,
+) -> tuple[Any, dict[str, str] | None]:
+    """Start a parent span in the scheduler representing a scheduled execution step.
+
+    Creates 'vllm.scheduler.step' linked to all request traces in the scheduled batch,
+    and returns the span along with a single W3C trace context carrier
+    ({"traceparent": ...}) to propagate to workers over IPC (~55 bytes instead of
+    full request headers).
+
+    Args:
+        trace_headers: Map of {req_id: carrier_dict} or list of carrier dicts
+            from scheduled requests.
+        step_id: Engine step counter / sequence.
+        num_tokens: Total scheduled tokens for this step.
+        attributes: Additional span attributes.
+
+    Returns:
+        tuple (span, carrier): The open step span object (to be ended when step
+        completes in update_from_output) and a single carrier dict to serialize
+        in SchedulerOutput.trace_headers.
+
+    """
+    if not _IS_OTEL_AVAILABLE:
+        return None, None
+
+    headers_list: list[Mapping[str, str]] = []
+    request_ids: list[str] = []
+    if isinstance(trace_headers, Mapping):
+        for req_id, th in trace_headers.items():
+            if th:
+                headers_list.append(th)
+                request_ids.append(str(req_id))
+    elif isinstance(trace_headers, list):
+        headers_list = [th for th in trace_headers if th]
+
+    if not headers_list:
+        return None, None
+
+    tracer = _get_tracer(__name__)
+    span_kwargs: dict[str, Any] = {
+        "name": "vllm.scheduler.step",
+    }
+
+    if len(headers_list) == 1:
+        parent_ctx = extract_trace_context(headers_list[0])
+        if parent_ctx is not None:
+            span_kwargs["context"] = parent_ctx
+    else:
+        links = []
+        for th in headers_list:
+            link = create_trace_link_otel(th)
+            if link is not None:
+                links.append(link)
+        if links:
+            span_kwargs["links"] = links
+
+    span = tracer.start_span(**span_kwargs)
+
+    span_attrs: dict[str, Any] = {
+        "vllm.batch_size": len(headers_list),
+    }
+    if num_tokens is not None:
+        span_attrs["vllm.num_tokens"] = num_tokens
+    if step_id is not None:
+        span_attrs["vllm.step_id"] = step_id
+    if request_ids:
+        span_attrs["vllm.request_ids"] = ",".join(request_ids)
+    if attributes:
+        span_attrs.update(attributes)
+    if span_attrs:
+        span.set_attributes(span_attrs)
+
+    carrier: dict[str, str] = {}
+    span_ctx = trace.set_span_in_context(span)
+    TraceContextTextMapPropagator().inject(carrier, context=span_ctx)
+
+    return span, carrier
+
+
 @contextmanager
 def trace_model_forward_otel(
     trace_headers: Mapping[str, Mapping[str, str]]
+    | Mapping[str, str]
     | list[Mapping[str, str]]
     | None = None,
     attributes: dict[str, Any] | None = None,
     num_tokens: int | None = None,
     step_id: int | None = None,
+    is_dummy: bool = False,
     defer_end: bool = False,
 ):
     """Context manager for tracing model forward passes.
 
     Creates a 'vllm.model.forward' span representing forward pass execution.
-    If single request, parents the span under the request span for intuitive hierarchy.
-    If multiple requests, links the span to all request spans.
-    Sets the forward span as the active span so that inner operations
-    (e.g., KV transfers, attention kernels) are parented to this forward pass.
-    Updates the process-level C trace context ring buffer for external telemetry
-    plugins. If defer_end is True, context is detached upon exit but span.end() is
-    deferred until the returned ForwardTraceHandle.end() is called
-    (e.g. at copy_event.synchronize).
+    Supports:
+      1. Single W3C carrier (Mapping[str, str], e.g. {"traceparent": ...}):
+         Extracted as parent context (typically from 'vllm.scheduler.step'),
+         unifying multi-worker (TP/PP) ranks under the exact same trace ID.
+      2. Dummy runs (is_dummy=True):
+         Enqueues a dummy slot (trace_id=0, parent_span_id=0, step_id=step_id)
+         into the GPU trace FIFO so GPU collectives executed during DP/EP
+         dummy batches advance commit_head and do not miscorrelate to previous
+         real steps.
+      3. Legacy multi-request mapping ({req_id: carrier}):
+         Parents single request or creates OpenTelemetry Links for batch.
+
+    Updates the process-level C trace context ring buffer and lock-free GPU FIFO
+    for external telemetry plugins (e.g. NCCL, DeepEP). If defer_end is True,
+    context is detached upon exit but span.end() and FIFO slot retirement to
+    VLLM_SLOT_COMPLETED are deferred until the returned ForwardTraceHandle.end()
+    is called (e.g. at copy_event.synchronize).
     """
+    if is_dummy:
+        from vllm.tracing.trace_context import (
+            ForwardTraceHandle,
+            update_trace_context,
+        )
+
+        update_trace_context(
+            trace_id=0,
+            parent_span_id=0,
+            step_id=step_id or 0,
+            trace_flags=0,
+        )
+        handle = ForwardTraceHandle(
+            span=None,
+            token=None,
+            step_id=step_id or 0,
+        )
+        try:
+            yield handle
+        finally:
+            if not defer_end:
+                handle.end()
+        return
+
     if not _IS_OTEL_AVAILABLE:
         yield None
         return
@@ -356,18 +476,51 @@ def trace_model_forward_otel(
         yield getattr(current_span, "_forward_trace_handle", None)
         return
 
-    # Extract valid headers list and request IDs
-    headers_list: list[Mapping[str, str]] = []
+    parent_ctx: Context | None = None
+    links: list[Any] = []
     request_ids: list[str] = []
-    if isinstance(trace_headers, dict):
-        for req_id, th in trace_headers.items():
-            if th:
-                headers_list.append(th)
-                request_ids.append(str(req_id))
+    batch_size = 1
+
+    if isinstance(trace_headers, Mapping):
+        # Check if trace_headers is a single W3C carrier dict (e.g. from scheduler)
+        if (
+            "traceparent" in trace_headers
+            or "TRACEPARENT" in trace_headers
+            or (
+                trace_headers
+                and all(
+                    isinstance(v, (str, bytes)) for v in trace_headers.values()
+                )
+            )
+        ):
+            parent_ctx = extract_trace_context(trace_headers)
+        else:
+            # Legacy multi-request mapping: {req_id: carrier_dict}
+            headers_list = []
+            for req_id, th in trace_headers.items():
+                if th:
+                    headers_list.append(th)
+                    request_ids.append(str(req_id))
+            batch_size = len(headers_list)
+            if len(headers_list) == 1:
+                parent_ctx = extract_trace_context(headers_list[0])
+            elif len(headers_list) > 1:
+                for th in headers_list:
+                    link = create_trace_link_otel(th)
+                    if link is not None:
+                        links.append(link)
     elif isinstance(trace_headers, list):
         headers_list = [th for th in trace_headers if th]
+        batch_size = len(headers_list)
+        if len(headers_list) == 1:
+            parent_ctx = extract_trace_context(headers_list[0])
+        elif len(headers_list) > 1:
+            for th in headers_list:
+                link = create_trace_link_otel(th)
+                if link is not None:
+                    links.append(link)
 
-    if not headers_list:
+    if parent_ctx is None and not links:
         yield None
         return
 
@@ -375,26 +528,17 @@ def trace_model_forward_otel(
     span_kwargs: dict[str, Any] = {
         "name": "vllm.model.forward",
     }
-
-    if len(headers_list) == 1:
-        parent_ctx = extract_trace_context(headers_list[0])
-        if parent_ctx:
-            span_kwargs["context"] = parent_ctx
-    else:
-        links = []
-        for th in headers_list:
-            link = create_trace_link_otel(th)
-            if link is not None:
-                links.append(link)
-        if links:
-            span_kwargs["links"] = links
+    if parent_ctx is not None:
+        span_kwargs["context"] = parent_ctx
+    if links:
+        span_kwargs["links"] = links
 
     span = tracer.start_span(**span_kwargs)
     span_attrs: dict[str, Any] = {}
     if num_tokens is not None:
         span_attrs["vllm.num_tokens"] = num_tokens
-    if headers_list:
-        span_attrs["vllm.batch_size"] = len(headers_list)
+    if batch_size > 0:
+        span_attrs["vllm.batch_size"] = batch_size
     if request_ids:
         span_attrs["vllm.request_ids"] = ",".join(request_ids)
     if step_id is not None:

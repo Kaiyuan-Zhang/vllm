@@ -52,7 +52,20 @@ void vllm_trace_context_clear(void) {
         __atomic_store_n(&g_vllm_trace_ring.slots[curr].is_valid, 0, __ATOMIC_RELEASE);
     }
     __atomic_store_n(&g_vllm_trace_ring.active_idx, 0xFFFFFFFFU, __ATOMIC_RELEASE);
-    vllm_trace_fifo_reset();
+    // Note: Do not call vllm_trace_fifo_reset() here to avoid destroying in-flight FIFO slots.
+}
+
+void vllm_trace_context_retire(uint64_t step_id) {
+    // 1. Retire FIFO slot for this step
+    vllm_trace_fifo_retire(step_id);
+
+    // 2. Invalidate matching slot in legacy ring buffer
+    for (uint32_t i = 0; i < VLLM_TRACE_CONTEXT_RING_CAPACITY; i++) {
+        if (g_vllm_trace_ring.slots[i].step_id == step_id) {
+            __atomic_store_n(&g_vllm_trace_ring.slots[i].is_valid, 0, __ATOMIC_RELEASE);
+            break;
+        }
+    }
 }
 
 int vllm_trace_context_get_active(vllmTraceContext_t* out_ctx) {
@@ -83,6 +96,28 @@ int vllm_trace_context_get_active(vllmTraceContext_t* out_ctx) {
         }
     }
 
+    return 0;
+}
+
+int vllm_trace_context_find_by_timestamp(uint64_t ptimer, vllmTraceContext_t* out_ctx) {
+    if (out_ctx == nullptr || ptimer == 0) {
+        return 0;
+    }
+
+    // 1. Try matching GPU hardware timestamp in FIFO
+    vllmFifoSlot_t fifo_slot;
+    if (vllm_trace_fifo_find_by_timestamp(ptimer, &fifo_slot)) {
+        out_ctx->trace_id_hi = fifo_slot.trace_id_hi;
+        out_ctx->trace_id_lo = fifo_slot.trace_id_lo;
+        out_ctx->parent_span_id = fifo_slot.parent_span_id;
+        out_ctx->step_id = fifo_slot.step_id;
+        out_ctx->trace_flags = fifo_slot.trace_flags;
+        out_ctx->is_valid = 1;
+        memset(out_ctx->_reserved, 0, sizeof(out_ctx->_reserved));
+        return 1;
+    }
+
+    // 2. Strict fail-closed: do not guess or fall back to active context when querying by timestamp
     return 0;
 }
 

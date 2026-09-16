@@ -858,6 +858,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         dp_sync = self.execute_model_state.dp_sync
+        if self.execute_model_state.forward_trace_handle is not None:
+            self.execute_model_state.forward_trace_handle.end()
         self.execute_model_state = None
 
         self.step_timing.forward_end()
@@ -1922,6 +1924,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 trace_headers=scheduler_output.trace_headers,
                 num_tokens=input_batch.num_tokens_after_padding,
                 step_id=self.step_id,
+                is_dummy=dummy_run,
                 defer_end=True,
             ) as forward_trace_handle:
                 self.kv_connector.pre_forward(
@@ -1942,6 +1945,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 trace_headers=scheduler_output.trace_headers,
                 num_tokens=input_batch.num_tokens_after_padding,
                 step_id=self.step_id,
+                is_dummy=dummy_run,
                 defer_end=True,
             ) as forward_trace_handle, set_forward_context(
                 attn_metadata,
