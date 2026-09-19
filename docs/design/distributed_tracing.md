@@ -299,10 +299,17 @@ This approach keeps existing users working while improving the value of traces f
 * Should tracing be decoupled from `log_stats` so tracing can be enabled without enabling metrics logging state? Currently in the V1 engine, the tracing implementation unconditionally relies on the request's timing metrics being present.  
 * How should detailed tracing modes be exposed in configuration?
 
-## **Initial PR Scope**
+## **Rollout Plan & PR Chain**
 
-The first implementation of PR should be intentionally small. [PR \#44402](https://github.com/vllm-project/vllm/pull/44402) is the current prototype for this direction, but should be treated as related work rather than as the full initial scope.
+To ensure changes remain reviewable, incremental, and well-tested, the implementation is decomposed into four sequential PRs:
 
-The first PR should preserve the existing `llm_request` behavior and add only the default request lifecycle spans from Phase 1: queue, remote-KV wait, prefill, and decode. It should include fake-collector coverage for span relationships, basic attributes, and cleanup on normal finish and abort/error paths. It should also explain the tracing-disabled overhead.
+* **PR 1: Core Request Lifecycle Spans** (Updating [PR #44402](https://github.com/vllm-project/vllm/pull/44402)):
+  Adds `vllm.request.queue`, `vllm.request.wait_remote_kv`, `vllm.request.prefill`, and `vllm.request.decode`. Preserves `llm_request` backward compatibility.
+* **PR 2: Model Forward & Worker Step Tracing**:
+  Adds opt-in `vllm.scheduler.step` and `vllm.model.forward` spans under `--collect-detailed-traces`.
+* **PR 3: Disaggregated KV Connector Tracing**:
+  Instruments `NixlConnector` and disaggregated KV cache transfer backends with `nixl.metadata.sync` and `nixl.rdma.transfer` spans.
+* **PR 4: Collective Communication Profiling (CoMMA)**:
+  Integrates low-overhead PyTorch C++ collective communication hooks (`ncclAllGather`, `ncclAllReduce`) correlated with active model forward spans.
 
-Batch-step spans, per-forward-pass spans, detailed KV transfer spans, batch correlation, and lower-level transport context propagation should remain follow-up work unless they are explicitly introduced behind a detailed tracing mode.  
+*(Note: The prerequisite multi-worker PRNG span ID collision bugfix is tracked in [PR #57670](https://github.com/vllm-project/vllm/pull/57670)).*
