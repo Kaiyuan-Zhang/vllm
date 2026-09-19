@@ -308,7 +308,7 @@ To ensure changes remain reviewable, incremental, and well-tested, the implement
 * **PR 2: Model Forward & Worker Step Tracing**:
   Adds opt-in `vllm.scheduler.step` and `vllm.model.forward` spans under `--collect-detailed-traces`.
 * **PR 3: Disaggregated KV Connector Tracing**:
-  Instruments `NixlConnector` and disaggregated KV cache transfer backends with `nixl.metadata.sync` and `nixl.rdma.transfer` spans.
+  Instruments `NixlConnector` and disaggregated KV cache transfer backends with `nixl.rdma.transfer` spans (capturing RDMA read/write duration, transferred bytes, block counts, and remote engine ID).
 * **PR 4: Collective Communication Profiling (CoMMA)**:
   Integrates low-overhead PyTorch C++ collective communication hooks (`ncclAllGather`, `ncclAllReduce`) correlated with active model forward spans.
 
